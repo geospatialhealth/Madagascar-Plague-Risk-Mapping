@@ -1,0 +1,535 @@
+---
+title: "Madagascar Plague Risk-Mapping Workflow"
+subtitle: "ENM downscaling, population exposure, and Getis–Ord Gi* hotspot analysis"
+author: "Mark Deka"
+output:
+  github_document:
+    toc: true
+    toc_depth: 3
+---
+
+# Overview
+
+This document provides a reproducible spatial workflow for mapping plague
+(*Yersinia pestis*) risk in Madagascar. It contains two analyses:
+
+1. Spatial downscaling of an ecological niche model (ENM) to the population
+   raster resolution, followed by classification of ecological suitability and
+   population into four classes and calculation of a combined risk score.
+2. Getis–Ord Gi* hotspot analysis of population-weighted risk at the fokontany
+   (Admin 4) level.
+
+The combined risk score is the product of the ENM class (0–3) and population
+class (0–3), producing the possible values 0, 1, 2, 3, 4, 6, and 9.
+
+# Requirements
+
+Install the required packages once if they are not already available:
+
+```r
+install.packages(c(
+  "terra",
+  "classInt",
+  "Ckmeans.1d.dp",
+  "sf",
+  "spdep",
+  "dplyr"
+))
+```
+
+Load the packages used by the workflow:
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+
+library(terra)
+library(classInt)
+library(sf)
+library(spdep)
+library(dplyr)
+```
+
+Code evaluation is disabled by default so that the document can be rendered
+before local data paths are configured. Change `eval = FALSE` to `eval = TRUE`
+after updating the paths and analysis settings.
+
+# Part 1: ENM downscaling and population-risk classification
+
+## Configuration
+
+Replace the example paths below with paths to the input files and desired
+output directory. The population raster also serves as the target grid for the
+downscaled ENM.
+
+```{r part1-config}
+enm_coarse_path <- "path/to/enm_coarse.tif"
+pop_path        <- "path/to/population_100m.tif"
+boundary_path   <- "path/to/madagascar_boundary.shp"
+out_dir         <- "outputs"
+
+resample_method <- "bilinear"
+clip_enm_values <- TRUE
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+gdal_opts <- c("COMPRESS=LZW", "TILED=YES")
+ok_ckm <- requireNamespace("Ckmeans.1d.dp", quietly = TRUE)
+```
+
+## Helper functions
+
+The first function samples finite raster values. The second estimates four
+data-driven class intervals using one-dimensional dynamic-programming
+clustering when available, with Fisher–Jenks intervals and quantiles as
+fallbacks. The third applies the breaks to a raster and assigns classes 0–3.
+
+```{r helper-functions}
+sample_values <- function(r, n = 200000, seed = 42) {
+  set.seed(seed)
+
+  smp <- spatSample(
+    r,
+    size = min(n, ncell(r)),
+    method = "regular",
+    as.points = FALSE,
+    values = TRUE,
+    na.rm = TRUE
+  )
+
+  values <- as.numeric(if (is.data.frame(smp)) smp[, 1] else smp)
+  values[is.finite(values)]
+}
+
+breaks_4 <- function(values) {
+  if (length(values) < 4L) {
+    stop("At least four finite raster values are required for classification.")
+  }
+
+  if (ok_ckm) {
+    ck <- Ckmeans.1d.dp::Ckmeans.1d.dp(values, k = 4)
+    breaks <- c(
+      min(values),
+      vapply(1:3, function(i) max(values[ck$cluster == i]), numeric(1)),
+      max(values)
+    )
+  } else {
+    ci <- classIntervals(values, n = 4, style = "fisher")
+    breaks <- ci$brks
+
+    if (length(unique(breaks)) < 5) {
+      breaks <- c(
+        min(values),
+        unname(quantile(values, c(0.25, 0.50, 0.75))),
+        max(values)
+      )
+    }
+  }
+
+  breaks
+}
+
+classify_4class <- function(r, breaks) {
+  reclassification <- matrix(
+    c(
+      -Inf,      breaks[2], 0,
+      breaks[2], breaks[3], 1,
+      breaks[3], breaks[4], 2,
+      breaks[4], Inf,       3
+    ),
+    ncol = 3,
+    byrow = TRUE
+  )
+
+  result <- classify(
+    r,
+    reclassification,
+    include.lowest = TRUE,
+    right = TRUE
+  )
+  levels(result) <- NULL
+  round(result)
+}
+```
+
+## Load, align, and downscale the rasters
+
+```{r downscale}
+cat("--- Part 1: Spatial downscaling ---\n")
+
+enm_coarse <- rast(enm_coarse_path)
+pop        <- rast(pop_path)
+boundary   <- vect(boundary_path)
+
+# Reproject the vector boundary to each raster before cropping.
+boundary_enm <- project(boundary, crs(enm_coarse))
+boundary_pop <- project(boundary, crs(pop))
+
+enm_coarse <- crop(enm_coarse, boundary_enm)
+pop        <- crop(pop, boundary_pop)
+
+# Resampling handles differences in CRS, extent, resolution, and origin.
+enm_fine <- resample(enm_coarse, pop, method = resample_method)
+
+if (clip_enm_values) {
+  enm_range <- global(enm_coarse, c("min", "max"), na.rm = TRUE)
+  enm_fine <- clamp(
+    enm_fine,
+    lower = enm_range[[1]],
+    upper = enm_range[[2]]
+  )
+}
+
+enm_fine <- mask(enm_fine, boundary_pop)
+pop      <- mask(pop, boundary_pop)
+
+f_enm <- file.path(out_dir, "ENM_downscaled_100m.tif")
+writeRaster(enm_fine, f_enm, overwrite = TRUE, gdal = gdal_opts)
+cat("Written:", f_enm, "\n")
+```
+
+## Classify ENM, population, and combined risk
+
+Population values are log-transformed only while estimating the four class
+breaks. The breaks are then returned to the population scale before raster
+classification.
+
+```{r classify-risk}
+cat("--- Part 2: Risk classification ---\n")
+
+pop_values <- sample_values(pop)
+pop_breaks <- expm1(breaks_4(log1p(pop_values)))
+
+enm_values <- sample_values(enm_fine, n = 100000)
+enm_breaks <- breaks_4(enm_values)
+
+pop_cls <- classify_4class(pop, pop_breaks)
+enm_cls <- classify_4class(enm_fine, enm_breaks)
+
+risk <- enm_cls * pop_cls
+risk <- ifel(is.na(pop) | pop == 0, 0, risk)
+
+f_pop_cls <- file.path(out_dir, "POP_class_0to3.tif")
+f_enm_cls <- file.path(out_dir, "ENM_class_0to3.tif")
+f_risk    <- file.path(out_dir, "RISK_0to9.tif")
+
+writeRaster(
+  pop_cls, f_pop_cls,
+  overwrite = TRUE, datatype = "INT1U", gdal = gdal_opts
+)
+writeRaster(
+  enm_cls, f_enm_cls,
+  overwrite = TRUE, datatype = "INT1U", gdal = gdal_opts
+)
+writeRaster(
+  risk, f_risk,
+  overwrite = TRUE, datatype = "INT1U", gdal = gdal_opts
+)
+
+cat("Written:", f_pop_cls, "\n")
+cat("Written:", f_enm_cls, "\n")
+cat("Written:", f_risk, "\n")
+```
+
+## Summarise population by risk class
+
+```{r zonal-summary}
+cat("--- Zonal summary ---\n")
+
+total_pop <- global(pop, "sum", na.rm = TRUE)[1, 1]
+
+zonal_summary <- as.data.frame(
+  terra::zonal(pop, risk, fun = "sum", na.rm = TRUE)
+)
+names(zonal_summary) <- c("risk_class", "population")
+
+zonal_summary$risk_class <- as.integer(round(zonal_summary$risk_class))
+zonal_summary$population <- round(zonal_summary$population)
+zonal_summary$share      <- zonal_summary$population / total_pop
+zonal_summary <- zonal_summary[order(zonal_summary$risk_class), ]
+
+summary_path <- file.path(out_dir, "people_by_risk_class.csv")
+write.csv(zonal_summary, summary_path, row.names = FALSE)
+
+cat("Total population:", format(total_pop, big.mark = ","), "\n")
+cat("Output directory:", out_dir, "\n")
+```
+
+# Part 2: Getis–Ord Gi* hotspot analysis
+
+## Configuration
+
+The distance threshold must be specified in metres. The example value below is
+only a placeholder and should be replaced with the threshold used in the
+analysis.
+
+```{r part2-config}
+risk_path <- file.path(out_dir, "RISK_0to9.tif")
+pop_path  <- "path/to/population_100m.tif"
+fkt_path  <- "path/to/fokontany_admin4.shp"
+
+hotspot_out_dir <- file.path(out_dir, "hotspot_analysis")
+dist_threshold  <- 50000 # metres; replace if a different threshold was used
+
+dir.create(hotspot_out_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Load and prepare the data
+
+EPSG:32738 (WGS 84 / UTM zone 38S) is used for distance-based operations in
+Madagascar. Population is aligned to the risk raster when their grids differ.
+
+```{r hotspot-load}
+cat("Loading data...\n")
+
+risk <- rast(risk_path)
+pop  <- rast(pop_path)
+
+if (!compareGeom(risk, pop, stopOnError = FALSE)) {
+  cat("Aligning population to the risk grid...\n")
+  pop <- resample(pop, risk, method = "bilinear")
+}
+
+stacked <- c(risk, pop)
+names(stacked) <- c("risk", "pop")
+
+fkt <- st_read(fkt_path, quiet = TRUE) |>
+  st_make_valid() |>
+  st_transform(32738)
+
+cat("Fokontany units:", nrow(fkt), "\n")
+```
+
+## Extract and aggregate raster values
+
+```{r zonal-extraction}
+cat("Extracting zonal statistics...\n")
+
+fkt$ZONE_ID <- seq_len(nrow(fkt))
+
+values <- extract(
+  stacked,
+  vect(st_transform(fkt, crs(risk))),
+  na.rm = FALSE
+)
+values <- as.data.frame(values)
+names(values) <- c("ZONE_ID", "risk", "pop")
+
+values <- values[!is.na(values$risk) & !is.na(values$pop), ]
+values$pop[values$pop < 0] <- 0
+values$risk <- as.numeric(values$risk)
+values$pop  <- as.numeric(values$pop)
+
+mean_risk <- values |>
+  group_by(ZONE_ID) |>
+  summarise(
+    mean_risk = mean(risk, na.rm = TRUE),
+    max_risk  = max(risk, na.rm = TRUE),
+    total_pop = sum(pop, na.rm = TRUE),
+    n_pixels  = n(),
+    .groups   = "drop"
+  )
+
+weighted <- values |>
+  filter(pop > 0) |>
+  group_by(ZONE_ID) |>
+  summarise(
+    weighted_risk = sum(risk * pop, na.rm = TRUE) /
+      sum(pop, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+fkt <- fkt |>
+  left_join(mean_risk, by = "ZONE_ID") |>
+  left_join(weighted, by = "ZONE_ID")
+
+fkt$mean_risk[is.na(fkt$mean_risk)]         <- 0
+fkt$max_risk[is.na(fkt$max_risk)]           <- 0
+fkt$total_pop[is.na(fkt$total_pop)]         <- 0
+fkt$weighted_risk[is.na(fkt$weighted_risk)] <- 0
+
+fkt$mean_risk     <- as.numeric(fkt$mean_risk)
+fkt$weighted_risk <- as.numeric(fkt$weighted_risk)
+fkt$total_pop     <- as.numeric(fkt$total_pop)
+
+fkt_analysis <- fkt[!is.na(fkt$n_pixels) &
+                      fkt$n_pixels > 0 &
+                      fkt$total_pop > 0, ]
+
+cat("Fokontany with data:", nrow(fkt_analysis), "\n")
+```
+
+## Construct spatial weights
+
+```{r spatial-weights}
+cat(
+  "Building spatial weights (",
+  dist_threshold / 1000,
+  " km threshold)...\n",
+  sep = ""
+)
+
+coords <- st_coordinates(st_centroid(fkt_analysis))
+neighbours <- dnearneigh(coords, d1 = 0, d2 = dist_threshold)
+
+n_isolates <- sum(card(neighbours) == 0)
+cat("Isolates:", n_isolates, "of", nrow(fkt_analysis), "\n")
+
+if (n_isolates > 0) {
+  cat("Removing", n_isolates, "isolates from the analysis\n")
+  fkt_analysis <- fkt_analysis[card(neighbours) > 0, ]
+  coords <- st_coordinates(st_centroid(fkt_analysis))
+  neighbours <- dnearneigh(coords, d1 = 0, d2 = dist_threshold)
+}
+
+list_weights <- nb2listw(neighbours, style = "W", zero.policy = TRUE)
+cat("Mean neighbours per unit:", round(mean(card(neighbours)), 1), "\n")
+```
+
+## Global spatial autocorrelation and local Gi*
+
+```{r spatial-statistics}
+cat("Testing global spatial autocorrelation...\n")
+
+moran_result <- moran.test(
+  fkt_analysis$weighted_risk,
+  list_weights,
+  zero.policy = TRUE
+)
+
+cat(
+  "Moran's I:", round(moran_result$estimate[1], 4),
+  "p-value:", format.pval(moran_result$p.value), "\n"
+)
+
+if (moran_result$p.value > 0.05) {
+  warning(paste(
+    "No significant global spatial autocorrelation was detected.",
+    "Local Gi* results should be interpreted with caution."
+  ))
+}
+
+cat("Running Gi*...\n")
+
+gi <- localG(
+  fkt_analysis$weighted_risk,
+  list_weights,
+  zero.policy = TRUE
+)
+
+fkt_analysis$gi_zscore <- as.numeric(gi)
+fkt_analysis$gi_pvalue <- 2 * pnorm(-abs(fkt_analysis$gi_zscore))
+
+fkt_analysis$cluster <- case_when(
+  fkt_analysis$gi_pvalue < 0.05 & fkt_analysis$gi_zscore > 0 ~ "Hotspot",
+  fkt_analysis$gi_pvalue < 0.05 & fkt_analysis$gi_zscore < 0 ~ "Coldspot",
+  TRUE ~ "Not significant"
+)
+
+# Labels correspond directly to the two-sided p-value thresholds.
+fkt_analysis$confidence <- case_when(
+  fkt_analysis$gi_pvalue < 0.001 & fkt_analysis$gi_zscore > 0 ~ "Hot p < 0.001",
+  fkt_analysis$gi_pvalue < 0.010 & fkt_analysis$gi_zscore > 0 ~ "Hot p < 0.01",
+  fkt_analysis$gi_pvalue < 0.050 & fkt_analysis$gi_zscore > 0 ~ "Hot p < 0.05",
+  fkt_analysis$gi_pvalue < 0.001 & fkt_analysis$gi_zscore < 0 ~ "Cold p < 0.001",
+  fkt_analysis$gi_pvalue < 0.010 & fkt_analysis$gi_zscore < 0 ~ "Cold p < 0.01",
+  fkt_analysis$gi_pvalue < 0.050 & fkt_analysis$gi_zscore < 0 ~ "Cold p < 0.05",
+  TRUE ~ "Not significant"
+)
+```
+
+## Summarise and export the results
+
+```{r hotspot-export}
+cat("\n=== Gi* results ===\n")
+cat("Cluster counts:\n")
+print(table(fkt_analysis$cluster))
+
+cat("\nSignificance breakdown:\n")
+print(table(fkt_analysis$confidence))
+
+hotspots <- fkt_analysis[fkt_analysis$cluster == "Hotspot", ]
+
+cat("\nHotspot fokontany:", nrow(hotspots), "\n")
+cat(
+  "Population in hotspots:",
+  format(sum(hotspots$total_pop), big.mark = ","),
+  "\n"
+)
+cat(
+  "Mean weighted risk in hotspots:",
+  round(mean(hotspots$weighted_risk), 2),
+  "\n"
+)
+
+# Use field names of no more than 10 characters for Shapefile compatibility.
+fkt_analysis$ZONE_ID   <- as.integer(fkt_analysis$ZONE_ID)
+fkt_analysis$n_pixels  <- as.integer(fkt_analysis$n_pixels)
+fkt_analysis$total_pop <- as.double(fkt_analysis$total_pop)
+fkt_analysis$max_risk  <- as.integer(fkt_analysis$max_risk)
+
+fkt_export <- fkt_analysis |>
+  rename(
+    w_risk  = weighted_risk,
+    m_risk  = mean_risk,
+    mx_risk = max_risk,
+    tot_pop = total_pop,
+    gi_z    = gi_zscore,
+    gi_p    = gi_pvalue,
+    conf    = confidence
+  )
+
+shapefile_path <- file.path(
+  hotspot_out_dir,
+  "fokontany_Gi_star.shp"
+)
+st_write(fkt_export, shapefile_path, delete_dsn = TRUE)
+
+# Change NAME_4 below if the fokontany-name field has a different name.
+csv_columns <- c(
+  "ZONE_ID", "NAME_4", "m_risk", "w_risk", "mx_risk", "tot_pop",
+  "gi_z", "gi_p", "cluster", "conf"
+)
+
+missing_columns <- setdiff(csv_columns, names(fkt_export))
+if (length(missing_columns) > 0) {
+  stop(
+    "Missing expected export column(s): ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+csv_path <- file.path(hotspot_out_dir, "fokontany_Gi_star.csv")
+out_csv <- st_drop_geometry(fkt_export)[, csv_columns]
+write.csv(out_csv, csv_path, row.names = FALSE)
+
+cat("\nOutputs saved to:", hotspot_out_dir, "\n")
+cat("Done.\n")
+```
+
+# Outputs
+
+After the paths and distance threshold are configured, the workflow creates:
+
+- `ENM_downscaled_100m.tif`: ENM resampled to the population grid.
+- `POP_class_0to3.tif`: population-density classes.
+- `ENM_class_0to3.tif`: ecological-suitability classes.
+- `RISK_0to9.tif`: combined ecological and population-risk classes.
+- `people_by_risk_class.csv`: estimated population and share by risk class.
+- `fokontany_Gi_star.shp`: fokontany-level spatial statistics.
+- `fokontany_Gi_star.csv`: non-spatial hotspot-analysis results.
+
+# Reproducibility notes
+
+- Record the exact value and justification for `dist_threshold` in the
+  manuscript or repository documentation.
+- Retain the input rasters' source, year, resolution, CRS, and NoData metadata.
+- Bilinear resampling is appropriate for continuous ENM and population
+  surfaces; it should not be used for categorical rasters.
+- ESRI Shapefiles truncate field names and consist of several companion files.
+  A GeoPackage (`.gpkg`) is preferable when downstream software supports it.
+- Run `sessionInfo()` after the analysis and save the output to document the R
+  and package versions used.
+
+```{r session-info}
+sessionInfo()
+```
