@@ -5,7 +5,7 @@ Plague continues to cause deadly outbreaks in Madagascar, yet health officials l
 # Citation
 Deka, M. A. (2026). A High-Resolution Geospatial Framework for Zoonotic Plague Risk Mapping in Madagascar. Zoonoses, 6(1).
 
-# Explore the interactive map: https://cchfvirus.github.io/Madagascar-Plague-Risk-Mapping/
+# Explore the interactive map: [https://cchfvirus.github.io/Madagascar-Plague-Risk-Mapping/](https://geospatialhealth.github.io/Madagascar-Plague-Risk-Mapping/)
 
 ---
 
